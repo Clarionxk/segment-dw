@@ -1,0 +1,27 @@
+# Output media directory
+downloads/
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.part
+*.ytdl
+
+# Authentication & Sensitive data
+cookies.txt
+*.cookie
+.env
+
+# Python bytecode & environments
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# OS specific
+.DS_Store
+Thumbs.db
+

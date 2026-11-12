@@ -1,0 +1,3 @@
+# Bitrate Backtrack - Python Requirements
+yt-dlp>=2025.01.01
+
