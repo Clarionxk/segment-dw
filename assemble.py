@@ -3,23 +3,22 @@
 assemble.py — Automated 1440p Video Editing, Audio Ducking & Intro Montage Engine.
 
 Features:
-  1. Full Auto-Detect Mode: Automatically pairs voiceovers (e.g. BioShock.wav) with
-     downloaded clips (e.g. BioShock_clip.mp4) without needing a manual markdown plan!
+  1. Full Auto-Detect Mode: Automatically pairs voiceovers (e.g. BioShock.wav, Call of Duty 4.wav)
+     with downloaded clips (e.g. BioShock_clip.mp4, CoD4_clip.mp4) using smart alias matching!
   2. Intro Trailer Montage: Auto-detects INTRO.wav, takes rapid cuts from clips in
-     download/ (or trailers/), ducks trailer audio, and syncs your Intro VO.
-  3. Pristine 1440p (2560x1440 @ 60fps) output — unlocks YouTube's premium VP9/AV1 codec.
-  4. Zero Black Bars:
-     - "crop" (default): Smart center-fill to 16:9 edge-to-edge (zero bars, zero stretch).
-     - "blur": Ambient frosted-glass blur background for 4:3 retro clips (zero bars, full HUD).
-  5. Fontconfig-Safe: Direct system font loading prevents Windows Fontconfig crashes.
-  6. Bug-Free Master Concat: Strict CFR 60fps, SAR 1:1, BT.709, and 48kHz stereo standardization.
+     download/, ducks trailer audio, and syncs your Intro VO.
+  3. CPU & GPU Auto-Switch: Real hardware encoder probe — uses CPU (libx264) by default on VPS
+     and automatically recovers if NVENC is unavailable.
+  4. Pristine 1440p (2560x1440 @ 60fps) output — unlocks YouTube's premium VP9/AV1 codec.
+  5. Zero Black Bars: Smart center-fill 16:9 crop (zero bars, zero stretch).
+  6. Fontconfig-Safe: Direct system font loading prevents Windows Fontconfig crashes.
 
 Usage:
-  # Auto-pair voiceovers and download folder:
-  python assemble.py --auto
+  # Auto-pair voiceovers and download folder on VPS (CPU mode):
+  python assemble.py --auto --cpu
 
-  # Custom directories:
-  python assemble.py --auto --clips-dir download --vo-dir voiceovers
+  # With solo gameplay SFX buffer:
+  python assemble.py --auto --clips-dir download --vo-dir voiceovers --solo-sfx 10
 """
 
 import os
@@ -40,6 +39,22 @@ RESOLUTIONS = {
     "1440p": (2560, 1440),
     "1080p": (1920, 1080),
     "4k": (3840, 2160),
+}
+
+# Common gaming acronyms and aliases
+ALIASES = {
+    "cod": "call of duty",
+    "cod4": "call of duty 4",
+    "l4d": "left 4 dead",
+    "tf2": "team fortress 2",
+    "ut3": "unreal tournament 3",
+    "ut2004": "unreal tournament 2004",
+    "moh": "medal of honor",
+    "et": "enemy territory",
+    "hl2": "half life 2",
+    "r6": "rainbow six",
+    "vegas": "rainbow six vegas",
+    "stalker": "s t a l k e r",
 }
 
 
@@ -63,11 +78,17 @@ def get_system_font() -> Optional[str]:
 SYSTEM_FONT = get_system_font()
 
 
-def check_nvenc_available() -> bool:
-    """Return True if ffmpeg has h264_nvenc encoder available."""
+def check_nvenc_real_support() -> bool:
+    """Test whether Nvidia NVENC hardware encoder actually works on current system hardware."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "testsrc=duration=0.1",
+        "-c:v", "h264_nvenc",
+        "-f", "null", "NUL" if os.name == "nt" else "/dev/null"
+    ]
     try:
-        res = subprocess.run(["ffmpeg", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        return "h264_nvenc" in res.stdout
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
     except Exception:
         return False
 
@@ -97,11 +118,52 @@ def has_audio_stream(file_path: str) -> bool:
     return "audio" in res.stdout.lower()
 
 
+def normalize_name(text: str) -> str:
+    """Normalize text expanding known aliases and removing punctuation."""
+    t = re.sub(r"[^a-zA-Z0-9\s]", " ", text).lower()
+    for short, full in ALIASES.items():
+        t = re.sub(rf"\b{short}\b", full, t)
+    return " ".join(t.split())
+
+
+def match_score(vo_title: str, clip_filename: str) -> int:
+    """Calculate match score between a voiceover title and a candidate clip filename."""
+    vo_norm = normalize_name(vo_title)
+    clip_norm = normalize_name(clip_filename)
+
+    # Exact or prefix match
+    if vo_norm in clip_norm or clip_norm.startswith(vo_norm):
+        return 100
+
+    vo_words = [w for w in vo_norm.split() if not w.isdigit() and len(w) > 2]
+    vo_digits = [w for w in vo_norm.split() if w.isdigit()]
+
+    clip_words = set([w for w in clip_norm.split() if not w.isdigit()])
+    clip_digits = set([w for w in clip_norm.split() if w.isdigit()])
+
+    # CRITICAL: Must match at least one non-digit keyword word!
+    matched_words = [w for w in vo_words if w in clip_words]
+    if not matched_words:
+        return 0
+
+    score = len(matched_words) * 15
+
+    # Reward matching digits (e.g. Far Cry 2 vs Far Cry 1)
+    for d in vo_digits:
+        if d in clip_digits:
+            score += 10
+        else:
+            score -= 10
+
+    # Distinguish Warhead vs Crysis original
+    if ("warhead" in vo_words) != ("warhead" in clip_words):
+        score -= 30
+
+    return score
+
+
 def find_best_matching_clip(vo_title: str, clips_dir: str) -> Optional[str]:
-    """
-    Smart fuzzy matcher that pairs a voiceover title (e.g. 'BioShock' or 'Call of Duty 4')
-    with the best video clip in clips_dir.
-    """
+    """Find the best video clip matching a voiceover title."""
     if not os.path.isdir(clips_dir):
         return None
 
@@ -109,66 +171,38 @@ def find_best_matching_clip(vo_title: str, clips_dir: str) -> Optional[str]:
     if not candidates:
         return None
 
-    vo_clean = re.sub(r"[^a-zA-Z0-9\s]", "", vo_title).lower()
-    vo_tokens = [t for t in vo_clean.split() if t not in ("game", "pc", "fps", "retro")]
-    vo_set = set(vo_tokens)
-
     best_clip = None
-    best_score = -999
+    best_score = 0
 
     for c in candidates:
-        base_name = os.path.splitext(os.path.basename(c))[0]
-        c_clean = re.sub(r"[^a-zA-Z0-9\s]", "", base_name).lower()
-        c_tokens = [t for t in c_clean.split() if t not in ("clip", "to", "end", "gameplay", "full", "hd", "1080p", "4k")]
-        c_set = set(c_tokens)
-
-        # 1. Exact or starts-with match
-        if vo_clean == c_clean or c_clean.startswith(vo_clean) or vo_clean in c_clean:
-            return c
-
-        # 2. Token overlap score
-        overlap = vo_set.intersection(c_set)
-        score = len(overlap) * 3
-
-        # Distinguish sub-titles like "Crysis Warhead" vs "Crysis"
-        if ("warhead" in vo_set) != ("warhead" in c_set):
-            score -= 15
-        if ("two" in vo_set or "2" in vo_set) and ("two" in c_set or "2" in c_set):
-            score += 4
-        if ("vegas" in vo_set) and ("vegas" in c_set):
-            score += 6
-        if ("edge" in vo_set) and ("edge" in c_set):
-            score += 6
-
-        if score > best_score and score >= max(1, len(vo_tokens) // 2):
-            best_score = score
+        base = os.path.splitext(os.path.basename(c))[0]
+        s = match_score(vo_title, base)
+        if s > best_score:
+            best_score = s
             best_clip = c
 
-    return best_clip
+    if best_score >= 10:
+        return best_clip
+
+    return None
 
 
 def auto_detect_pairs(vo_dir: str, clips_dir: str) -> Tuple[Optional[str], List[Dict[str, str]]]:
-    """
-    Auto-detect voiceover files in vo_dir and pair them with matching clips in clips_dir.
-    Returns (intro_vo_path, list_of_pairs).
-    """
+    """Auto-detect voiceovers and pair with video clips."""
     intro_vo = None
     pairs = []
 
     if not os.path.isdir(vo_dir):
         return None, []
 
-    # Gather audio files (.wav, .mp3, .m4a, .aac)
     vo_files = []
     for ext in ("*.wav", "*.mp3", "*.m4a", "*.aac", "*.ogg"):
         vo_files.extend(glob.glob(os.path.join(vo_dir, ext)))
 
-    # Sort files naturally
     vo_files = sorted(vo_files, key=lambda x: os.path.basename(x).lower())
 
     for vf in vo_files:
         base = os.path.splitext(os.path.basename(vf))[0]
-        # Check if this is the intro voiceover
         if "intro" in base.lower() or base.startswith("00") or base.startswith("0_"):
             intro_vo = vf
             continue
@@ -208,10 +242,8 @@ def build_video_filter(width: int, height: int, aspect_mode: str, total_duration
             f"crop={width}:{height},setsar=1,fps={fps}"
         )
 
-    # Clean title text for drawtext
     clean_title = (title_text or "").replace("'", "").replace(":", " -")
     if clean_title and SYSTEM_FONT:
-        # Use direct fontfile path to prevent Fontconfig errors
         v_filter += (
             f",drawtext=fontfile='{SYSTEM_FONT}':text='{clean_title}':x=80:y=h-140:fontsize=56:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=12:enable='between(t,0,6)'"
         )
@@ -231,7 +263,7 @@ def assemble_segment(
     use_gpu: bool = False,
     show_title_card: bool = True,
 ) -> float:
-    """Assemble a single countdown segment with 1440p standardization, audio ducking, and title card."""
+    """Assemble a single countdown segment with automatic GPU -> CPU fallback."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     width, height = RESOLUTIONS.get(target_res, (2560, 1440))
 
@@ -263,39 +295,60 @@ def assemble_segment(
 
     filter_complex = f"[0:v]{v_filter}[vout];{a_filter}"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", vo_path,
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-pix_fmt", "yuv420p",
-        "-colorspace", "bt709",
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-    ]
+    def build_cmd(gpu: bool) -> List[str]:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", vo_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+        ]
+        if gpu:
+            cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
+        else:
+            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+        cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path])
+        return cmd
 
+    # Try GPU if requested, but gracefully fall back to CPU if hardware fails
     if use_gpu:
-        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
-    else:
-        cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+        res = subprocess.run(build_cmd(gpu=True), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            return total_duration
 
-    cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path])
+    # CPU Execution
+    res = subprocess.run(build_cmd(gpu=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode == 0:
+        return total_duration
 
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        # Fallback if drawtext fails
-        if "drawtext" in filter_complex:
-            v_filter_fallback = build_video_filter(width=width, height=height, aspect_mode=aspect_mode, total_duration=total_duration, title_text=None)
-            cmd[cmd.index("-filter_complex") + 1] = f"[0:v]{v_filter_fallback}[vout];{a_filter}"
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0:
-                return total_duration
+    # Fallback without drawtext if font/drawtext caused issue
+    if "drawtext" in filter_complex:
+        v_fallback = build_video_filter(width=width, height=height, aspect_mode=aspect_mode, total_duration=total_duration, title_text=None)
+        filter_complex_fallback = f"[0:v]{v_fallback}[vout];{a_filter}"
+        cmd_fallback = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", vo_path,
+            "-filter_complex", filter_complex_fallback,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path
+        ]
+        res = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            return total_duration
 
-        raise RuntimeError(f"FFmpeg assembly failed: {res.stderr[-400:]}")
-
-    return total_duration
+    raise RuntimeError(f"FFmpeg assembly failed: {res.stderr[-400:]}")
 
 
 def assemble_intro_montage(
@@ -309,7 +362,7 @@ def assemble_intro_montage(
     title_text: Optional[str] = "BITRATE BACKTRACK",
     use_gpu: bool = False,
 ) -> float:
-    """Assemble an intro sizzle-reel montage from trailers/clips matching Intro VO length."""
+    """Assemble an intro sizzle-reel montage from trailers/clips with GPU/CPU fallback."""
     width, height = RESOLUTIONS.get(target_res, (2560, 1440))
     vo_duration = get_media_duration(intro_vo_path)
 
@@ -360,40 +413,37 @@ def assemble_intro_montage(
 
     filter_complex = ";".join(filter_parts)
 
-    cmd = ["ffmpeg", "-y"]
-    for s in slices:
-        cmd.extend(["-i", s[0]])
-    cmd.extend(["-i", intro_vo_path])
-    cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-pix_fmt", "yuv420p",
-        "-colorspace", "bt709",
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-    ])
+    def build_cmd(gpu: bool) -> List[str]:
+        cmd = ["ffmpeg", "-y"]
+        for s in slices:
+            cmd.extend(["-i", s[0]])
+        cmd.extend(["-i", intro_vo_path])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+        ])
+        if gpu:
+            cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
+        else:
+            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+        cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path])
+        return cmd
 
     if use_gpu:
-        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
-    else:
-        cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+        res = subprocess.run(build_cmd(gpu=True), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            return vo_duration
 
-    cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path])
+    res = subprocess.run(build_cmd(gpu=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode == 0:
+        return vo_duration
 
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        # Fallback if drawtext caused the error
-        if "drawtext" in filter_complex:
-            filter_parts[-3] = "[vmontage_raw]copy[vout]"
-            cmd[cmd.index("-filter_complex") + 1] = ";".join(filter_parts)
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0:
-                return vo_duration
-
-        raise RuntimeError(f"FFmpeg intro assembly failed: {res.stderr[-400:]}")
-
-    return vo_duration
+    raise RuntimeError(f"FFmpeg intro assembly failed: {res.stderr[-400:]}")
 
 
 def concat_segments(segment_paths: List[str], output_master_path: str):
@@ -442,11 +492,10 @@ def main():
     parser.add_argument("--intro-cut", type=float, default=3.5, help="Duration of each trailer cut in intro montage (default: 3.5s)")
     parser.add_argument("--no-title", action="store_true", help="Disable on-screen title card overlay")
     parser.add_argument("--gpu", action="store_true", help="Force Nvidia NVENC hardware acceleration")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU encoding (libx264)")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU encoding (libx264) - recommended for VPS")
 
     args = parser.parse_args()
 
-    # Fallback to ./downloads if ./download doesn't exist
     if not os.path.isdir(args.clips_dir) and os.path.isdir("./downloads"):
         args.clips_dir = "./downloads"
 
@@ -454,15 +503,16 @@ def main():
     print("      BITRATE BACKTRACK — 1440P AUTOMATED EDITING & INTRO ENGINE       ")
     print("=" * 75)
 
-    nvenc_avail = check_nvenc_available()
+    # Determine encoder: default to CPU on VPS unless --gpu is explicitly requested AND verified
     use_gpu = False
-    if args.gpu:
-        if not nvenc_avail:
-            print("[!] Warning: --gpu requested but h264_nvenc was not found. Falling back to CPU.")
-        else:
+    if args.gpu and not args.cpu:
+        if check_nvenc_real_support():
             use_gpu = True
-    elif not args.cpu and nvenc_avail:
-        use_gpu = True
+        else:
+            print("[!] Warning: Nvidia GPU hardware not detected on this machine. Using CPU (libx264).")
+    elif not args.cpu:
+        # Auto-detect real hardware support
+        use_gpu = check_nvenc_real_support()
 
     print(f"[*] Target Resolution:    {args.target_res} ({RESOLUTIONS[args.target_res][0]}x{RESOLUTIONS[args.target_res][1]} @ 60fps)")
     print(f"[*] Aspect Ratio Mode:    {args.aspect.upper()} ({'Smart Center Fill — Zero Black Bars' if args.aspect == 'crop' else 'Frosted Ambient Blur Background'})")
@@ -472,9 +522,7 @@ def main():
     print(f"[*] Clips Folder:         {os.path.abspath(args.clips_dir)}")
     print(f"[*] Voiceovers Folder:    {os.path.abspath(args.vo_dir)}")
 
-    # Check whether to use auto-detect or markdown plan
     use_auto_detect = args.auto or (not args.plan) or (args.plan == "videoplan1.md")
-
     intro_vo_file = None
     items_to_assemble = []
 
@@ -482,8 +530,6 @@ def main():
         print("\n[*] SCANNING FOLDERS FOR AUTO-DETECT...")
         detected_intro, detected_pairs = auto_detect_pairs(args.vo_dir, args.clips_dir)
         intro_vo_file = args.intro_vo or detected_intro
-
-        # Filter pairs that have matching video clips
         for p in detected_pairs:
             items_to_assemble.append({
                 "title": p["title"],
@@ -491,7 +537,6 @@ def main():
                 "vo_path": p["vo_path"],
             })
     else:
-        # Load from markdown plan
         if not os.path.isfile(args.plan):
             print(f"[!] Plan file not found: {args.plan}")
             sys.exit(1)
@@ -519,7 +564,6 @@ def main():
 
     if not items_to_assemble and not intro_vo_file:
         print(f"\n[!] Error: No voiceover files found in {args.vo_dir}!")
-        print(f"    Please place your .wav or .mp3 files into: {os.path.abspath(args.vo_dir)}")
         sys.exit(1)
 
     assembled_dir = os.path.join(args.output_dir, "assembled_segments")
@@ -529,9 +573,7 @@ def main():
     chapters = []
     current_time = 0.0
 
-    # -----------------------------------------------------------------------
-    # Step 1: Assemble Intro Montage (if intro VO exists)
-    # -----------------------------------------------------------------------
+    # Step 1: Assemble Intro Montage
     if intro_vo_file and os.path.isfile(intro_vo_file):
         print("\n" + "-" * 75)
         print(f"[*] INTRO DETECTED: {os.path.basename(intro_vo_file)}")
@@ -563,9 +605,7 @@ def main():
         else:
             print(f"    [!] No trailer clips found in {trailers_dir}. Skipping intro.")
 
-    # -----------------------------------------------------------------------
     # Step 2: Assemble Countdown Segments
-    # -----------------------------------------------------------------------
     print("\n" + "-" * 75)
     print(f"{'#':<4} {'Title':<28} {'Video Clip':<28} {'Voiceover File'}")
     print("-" * 75)
@@ -628,9 +668,7 @@ def main():
         print("\n[!] No segments were assembled. Please ensure both video clips and voiceovers exist.")
         return
 
-    # -----------------------------------------------------------------------
-    # Step 3: Lossless Master Concatenation
-    # -----------------------------------------------------------------------
+    # Step 3: Concat
     print("\n" + "=" * 75)
     print(f"[*] Merging {len(assembled_files)} standardized segments into Master Video...")
     master_output = os.path.join(args.output_dir, "master_compilation.mp4")
