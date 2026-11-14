@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-assemble.py — Automated 1440p Video Editing, Audio Ducking & Intro Montage Engine.
+assemble.py — Automated 1440p Video Editing, Full Gameplay Extension & Intro Montage Engine.
 
-Features:
-  1. Full Auto-Detect Mode: Automatically pairs voiceovers (e.g. BioShock.wav, Call of Duty 4.wav)
-     with downloaded clips (e.g. BioShock_clip.mp4, CoD4_clip.mp4) using smart alias matching!
-  2. Intro Trailer Montage: Auto-detects INTRO.wav, takes rapid cuts from clips in
-     download/, ducks trailer audio, and syncs your Intro VO.
-  3. CPU & GPU Auto-Switch: Real hardware encoder probe — uses CPU (libx264) by default on VPS
-     and automatically recovers if NVENC is unavailable.
-  4. Pristine 1440p (2560x1440 @ 60fps) output — unlocks YouTube's premium VP9/AV1 codec.
-  5. Zero Black Bars: Smart center-fill 16:9 crop (zero bars, zero stretch).
-  6. Fontconfig-Safe: Direct system font loading prevents Windows Fontconfig crashes.
+Core Architecture:
+  1. Full Gameplay Video Duration:
+     - The voiceover plays over the beginning of the clip with ducking (game audio @ 18%).
+     - Once VO finishes, game audio smoothly swells to 100% and the video continues
+       playing for the ENTIRE duration of the downloaded gameplay clip!
+     - When the gameplay clip finishes naturally, it transitions to the next game.
+  2. Intro Trailer Montage:
+     - Uses trailer videos (from --trailers-dir, ./trailers, or files with 'trailer' in name).
+     - Cut together to match the EXACT runtime of the INTRO Voiceover.
+     - As soon as the Intro VO finishes, it cuts DIRECTLY to the countdown (zero delay).
+  3. Smart Acronym & Title Matching:
+     - Matches CoD4 <-> Call of Duty 4, TF2 <-> Team Fortress 2, UT3 <-> Unreal Tournament 3,
+       MoH <-> Medal of Honor, ET <-> Enemy Territory, etc.
+  4. Native 1440p (2560x1440 @ 60fps):
+     - Zero black bars via smart center-fill 16:9 crop.
+     - Fontconfig-safe direct system font loading.
 
 Usage:
-  # Auto-pair voiceovers and download folder on VPS (CPU mode):
+  # Auto-pair voiceovers and download folder:
   python assemble.py --auto --cpu
 
-  # With solo gameplay SFX buffer:
-  python assemble.py --auto --clips-dir download --vo-dir voiceovers --solo-sfx 10
+  # If trailers are in a specific folder:
+  python assemble.py --auto --cpu --trailers-dir ./trailers
 """
 
 import os
@@ -79,7 +85,7 @@ SYSTEM_FONT = get_system_font()
 
 
 def check_nvenc_real_support() -> bool:
-    """Test whether Nvidia NVENC hardware encoder actually works on current system hardware."""
+    """Test whether Nvidia NVENC hardware encoder actually works on current hardware."""
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", "testsrc=duration=0.1",
@@ -159,11 +165,15 @@ def match_score(vo_title: str, clip_filename: str) -> int:
     if ("warhead" in vo_words) != ("warhead" in clip_words):
         score -= 30
 
+    # Exclude trailers from countdown gameplay clips if there are other options
+    if any(k in clip_norm for k in ("trailer", "teaser", "cinematic")):
+        score -= 5
+
     return score
 
 
 def find_best_matching_clip(vo_title: str, clips_dir: str) -> Optional[str]:
-    """Find the best video clip matching a voiceover title."""
+    """Find the best gameplay video clip matching a voiceover title."""
     if not os.path.isdir(clips_dir):
         return None
 
@@ -185,6 +195,35 @@ def find_best_matching_clip(vo_title: str, clips_dir: str) -> Optional[str]:
         return best_clip
 
     return None
+
+
+def get_trailer_clips(trailers_dir: Optional[str], clips_dir: str) -> List[str]:
+    """Find trailer clips to use exclusively for the intro sizzle-reel montage."""
+    # 1. Check explicit trailers directory
+    if trailers_dir and os.path.isdir(trailers_dir):
+        t_files = glob.glob(os.path.join(trailers_dir, "*.mp4"))
+        if t_files:
+            return sorted(t_files)
+
+    # 2. Check ./trailers folder
+    if os.path.isdir("./trailers"):
+        t_files = glob.glob(os.path.join("./trailers", "*.mp4"))
+        if t_files:
+            return sorted(t_files)
+
+    # 3. Check clips directory for clips with 'trailer', 'teaser', 'cinematic', etc.
+    if os.path.isdir(clips_dir):
+        all_clips = glob.glob(os.path.join(clips_dir, "*.mp4"))
+        trailer_keywords = ("trailer", "teaser", "cinematic", "launch", "promo", "intro")
+        filtered_trailers = [
+            c for c in all_clips if any(k in os.path.basename(c).lower() for k in trailer_keywords)
+        ]
+        if filtered_trailers:
+            return sorted(filtered_trailers)
+        # Fallback to general clips if no dedicated trailers exist
+        return sorted(all_clips)
+
+    return []
 
 
 def auto_detect_pairs(vo_dir: str, clips_dir: str) -> Tuple[Optional[str], List[Dict[str, str]]]:
@@ -258,18 +297,31 @@ def assemble_segment(
     target_res: str = "1440p",
     aspect_mode: str = "crop",
     title_text: Optional[str] = None,
-    solo_sfx_duration: float = 10.0,
     duck_volume: float = 0.18,
+    max_clip_duration: Optional[float] = None,
     use_gpu: bool = False,
     show_title_card: bool = True,
 ) -> float:
-    """Assemble a single countdown segment with automatic GPU -> CPU fallback."""
+    """
+    Assemble a countdown segment:
+      - Plays the FULL gameplay video clip!
+      - Voiceover plays over the start with audio ducked to 18%.
+      - Gameplay audio swells to 100% and plays raw until the gameplay clip finishes.
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     width, height = RESOLUTIONS.get(target_res, (2560, 1440))
 
     vo_duration = get_media_duration(vo_path)
-    total_duration = vo_duration + max(0.0, solo_sfx_duration)
+    video_duration = get_media_duration(video_path)
+
+    # Use the full gameplay video duration (or capped by max_clip_duration if specified)
+    if max_clip_duration and video_duration > max_clip_duration:
+        total_duration = max(vo_duration + 5.0, max_clip_duration)
+    else:
+        total_duration = max(vo_duration + 2.0, video_duration)
+
     game_has_audio = has_audio_stream(video_path)
+    pad_duration = max(0.0, total_duration - vo_duration)
 
     v_filter = build_video_filter(
         width=width,
@@ -280,16 +332,17 @@ def assemble_segment(
     )
 
     if game_has_audio:
+        # Audio ducking: 18% during VO, 1s smooth swell, 100% full gameplay sound for the remainder
         a_filter = (
             f"[0:a]volume='if(lt(t,{vo_duration:.2f}),{duck_volume:.2f},if(lt(t,{vo_duration + 1.0:.2f}),{duck_volume:.2f}+{(1.0 - duck_volume):.2f}*(t-{vo_duration:.2f}),1.0))':eval=frame,"
             f"atrim=duration={total_duration:.2f},asetpts=PTS-STARTPTS[aducked];"
-            f"[1:a]volume=1.0,apad=pad_dur={solo_sfx_duration:.2f},atrim=duration={total_duration:.2f},asetpts=PTS-STARTPTS[avo];"
+            f"[1:a]volume=1.0,apad=pad_dur={pad_duration:.2f},atrim=duration={total_duration:.2f},asetpts=PTS-STARTPTS[avo];"
             f"[aducked][avo]amix=inputs=2:duration=first:dropout_transition=2,"
             f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]"
         )
     else:
         a_filter = (
-            f"[1:a]volume=1.0,apad=pad_dur={solo_sfx_duration:.2f},atrim=duration={total_duration:.2f},asetpts=PTS-STARTPTS,"
+            f"[1:a]volume=1.0,apad=pad_dur={pad_duration:.2f},atrim=duration={total_duration:.2f},asetpts=PTS-STARTPTS,"
             f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]"
         )
 
@@ -315,7 +368,6 @@ def assemble_segment(
         cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ar", "48000", output_path])
         return cmd
 
-    # Try GPU if requested, but gracefully fall back to CPU if hardware fails
     if use_gpu:
         res = subprocess.run(build_cmd(gpu=True), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if res.returncode == 0:
@@ -326,15 +378,14 @@ def assemble_segment(
     if res.returncode == 0:
         return total_duration
 
-    # Fallback without drawtext if font/drawtext caused issue
+    # Fallback without drawtext if font error occurred
     if "drawtext" in filter_complex:
         v_fallback = build_video_filter(width=width, height=height, aspect_mode=aspect_mode, total_duration=total_duration, title_text=None)
-        filter_complex_fallback = f"[0:v]{v_fallback}[vout];{a_filter}"
         cmd_fallback = [
             "ffmpeg", "-y",
             "-i", video_path,
             "-i", vo_path,
-            "-filter_complex", filter_complex_fallback,
+            "-filter_complex", f"[0:v]{v_fallback}[vout];{a_filter}",
             "-map", "[vout]",
             "-map", "[aout]",
             "-pix_fmt", "yuv420p",
@@ -362,7 +413,12 @@ def assemble_intro_montage(
     title_text: Optional[str] = "BITRATE BACKTRACK",
     use_gpu: bool = False,
 ) -> float:
-    """Assemble an intro sizzle-reel montage from trailers/clips with GPU/CPU fallback."""
+    """
+    Assemble the Intro Montage from trailer videos:
+      - Slices trailers into rapid ~3.5s cuts.
+      - Slices match the EXACT duration of the Intro VO (zero extra solo delay!).
+      - Cuts directly to the countdown as soon as the intro narration ends.
+    """
     width, height = RESOLUTIONS.get(target_res, (2560, 1440))
     vo_duration = get_media_duration(intro_vo_path)
 
@@ -475,20 +531,20 @@ def concat_segments(segment_paths: List[str], output_master_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Automated 1440p Video Editing, Audio Ducking & Intro Montage Engine.",
+        description="Automated 1440p Video Editing, Full Gameplay Extension & Intro Montage Engine.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("plan", nargs="?", default=None, help="Optional path to markdown plan file (leave empty for auto-detect)")
     parser.add_argument("--auto", action="store_true", help="Force auto-pairing of voiceovers and clips by filename without markdown plan")
     parser.add_argument("--clips-dir", default="./download", help="Directory containing downloaded gameplay video clips (default: ./download)")
     parser.add_argument("--vo-dir", default="./voiceovers", help="Directory containing voiceover audio files (default: ./voiceovers)")
+    parser.add_argument("--trailers-dir", default=None, help="Directory containing trailer clips for intro montage (default: checks ./trailers or clips with 'trailer' in name)")
     parser.add_argument("--output-dir", default="./output", help="Directory to save assembled segments and master compilation")
     parser.add_argument("--target-res", default="1440p", choices=["1440p", "1080p", "4k"], help="Target resolution (default: 1440p = 2560x1440)")
     parser.add_argument("--aspect", default="crop", choices=["crop", "blur", "pad"], help="Aspect ratio mode (crop = fill screen, no black bars; blur = frosted ambient background)")
-    parser.add_argument("--solo-sfx", type=float, default=10.0, help="Solo gameplay SFX duration in seconds after VO ends (default: 10.0s)")
     parser.add_argument("--duck-vol", type=float, default=0.18, help="Gameplay volume while VO is speaking (default: 0.18 = 18 percent)")
+    parser.add_argument("--max-clip-len", type=float, default=None, help="Optional max duration in seconds to cap gameplay clips (default: play full clip)")
     parser.add_argument("--intro-vo", default=None, help="Path to intro voiceover file (auto-detected if in vo-dir)")
-    parser.add_argument("--intro-clips-dir", default=None, help="Directory containing trailer clips for intro montage (defaults to clips-dir)")
     parser.add_argument("--intro-cut", type=float, default=3.5, help="Duration of each trailer cut in intro montage (default: 3.5s)")
     parser.add_argument("--no-title", action="store_true", help="Disable on-screen title card overlay")
     parser.add_argument("--gpu", action="store_true", help="Force Nvidia NVENC hardware acceleration")
@@ -500,10 +556,9 @@ def main():
         args.clips_dir = "./downloads"
 
     print("\n" + "=" * 75)
-    print("      BITRATE BACKTRACK — 1440P AUTOMATED EDITING & INTRO ENGINE       ")
+    print("      BITRATE BACKTRACK — 1440P FULL GAMEPLAY COMPILATION ENGINE       ")
     print("=" * 75)
 
-    # Determine encoder: default to CPU on VPS unless --gpu is explicitly requested AND verified
     use_gpu = False
     if args.gpu and not args.cpu:
         if check_nvenc_real_support():
@@ -511,14 +566,13 @@ def main():
         else:
             print("[!] Warning: Nvidia GPU hardware not detected on this machine. Using CPU (libx264).")
     elif not args.cpu:
-        # Auto-detect real hardware support
         use_gpu = check_nvenc_real_support()
 
     print(f"[*] Target Resolution:    {args.target_res} ({RESOLUTIONS[args.target_res][0]}x{RESOLUTIONS[args.target_res][1]} @ 60fps)")
     print(f"[*] Aspect Ratio Mode:    {args.aspect.upper()} ({'Smart Center Fill — Zero Black Bars' if args.aspect == 'crop' else 'Frosted Ambient Blur Background'})")
     print(f"[*] Video Encoder:        {'Nvidia NVENC (GPU Accelerated)' if use_gpu else 'CPU (libx264 veryfast)'}")
-    print(f"[*] Audio Duck Volume:    {int(args.duck_vol * 100)}% during voiceover")
-    print(f"[*] Solo Gameplay Swell:  {args.solo_sfx:.1f}s after voiceover ends")
+    print(f"[*] Audio Duck Volume:    {int(args.duck_vol * 100)}% during voiceover (100% full volume afterwards)")
+    print(f"[*] Gameplay Mode:        FULL CLIP PLAYOUT (Voiceover is at the start, gameplay extends clip)")
     print(f"[*] Clips Folder:         {os.path.abspath(args.clips_dir)}")
     print(f"[*] Voiceovers Folder:    {os.path.abspath(args.vo_dir)}")
 
@@ -573,16 +627,17 @@ def main():
     chapters = []
     current_time = 0.0
 
-    # Step 1: Assemble Intro Montage
+    # -----------------------------------------------------------------------
+    # Step 1: Assemble Intro Montage (Trailers only, cuts directly to countdown)
+    # -----------------------------------------------------------------------
     if intro_vo_file and os.path.isfile(intro_vo_file):
         print("\n" + "-" * 75)
         print(f"[*] INTRO DETECTED: {os.path.basename(intro_vo_file)}")
 
-        trailers_dir = args.intro_clips_dir or ("./trailers" if os.path.isdir("./trailers") else args.clips_dir)
-        trailer_clips = glob.glob(os.path.join(trailers_dir, "*.mp4"))
+        trailer_clips = get_trailer_clips(args.trailers_dir, args.clips_dir)
 
         if trailer_clips:
-            print(f"    Building rapid-cut intro montage from {len(trailer_clips)} clips in {trailers_dir}...")
+            print(f"    Building rapid-cut intro montage from {len(trailer_clips)} trailer clips...")
             intro_output = os.path.join(assembled_dir, "segment_00_intro.mp4")
             try:
                 intro_dur = assemble_intro_montage(
@@ -599,28 +654,35 @@ def main():
                 chapters.append(f"{format_time_str(current_time)} - Intro")
                 current_time += intro_dur
                 assembled_files.append(intro_output)
-                print(f"    [+] Intro montage ready ({intro_dur:.1f}s)")
+                print(f"    [+] Intro montage ready ({intro_dur:.1f}s) -> Cuts directly to countdown!")
             except Exception as e:
                 print(f"    [!] Failed to assemble intro montage: {e}")
         else:
-            print(f"    [!] No trailer clips found in {trailers_dir}. Skipping intro.")
+            print(f"    [!] No trailer clips found. Skipping intro montage.")
 
-    # Step 2: Assemble Countdown Segments
+    # -----------------------------------------------------------------------
+    # Step 2: Assemble Full Countdown Segments (Extended Gameplay)
+    # -----------------------------------------------------------------------
     print("\n" + "-" * 75)
     print(f"{'#':<4} {'Title':<28} {'Video Clip':<28} {'Voiceover File'}")
     print("-" * 75)
 
     valid_count = 0
+    total_est_seconds = current_time
     for idx, item in enumerate(items_to_assemble, 1):
         t_desc = item["title"][:26]
         v_desc = os.path.basename(item["video_path"])[:26] if item["video_path"] else "MISSING"
         vo_desc = os.path.basename(item["vo_path"])[:26] if item["vo_path"] else "MISSING"
         if item["video_path"] and item["vo_path"]:
             valid_count += 1
+            try:
+                total_est_seconds += get_media_duration(item["video_path"])
+            except Exception:
+                pass
         print(f"{idx:<4} {t_desc:<28} {v_desc:<28} {vo_desc}")
 
     print("-" * 75)
-    print(f"[*] Found {valid_count} ready pair(s) out of {len(items_to_assemble)} item(s).")
+    print(f"[*] Found {valid_count} ready pair(s). Estimated Full Runtime: ~{format_time_str(total_est_seconds)}")
 
     for idx, item in enumerate(items_to_assemble, 1):
         title = item["title"]
@@ -639,8 +701,8 @@ def main():
         out_path = os.path.join(assembled_dir, out_name)
 
         print(f"\n[{idx}/{len(items_to_assemble)}] Assembling: {title}")
-        print(f"    Video: {os.path.basename(video_path)}")
-        print(f"    Audio: {os.path.basename(vo_path)}")
+        print(f"    Video (Full Play): {os.path.basename(video_path)}")
+        print(f"    Narration (VO):    {os.path.basename(vo_path)}")
 
         try:
             dur = assemble_segment(
@@ -650,8 +712,8 @@ def main():
                 target_res=args.target_res,
                 aspect_mode=args.aspect,
                 title_text=title,
-                solo_sfx_duration=args.solo_sfx,
                 duck_volume=args.duck_vol,
+                max_clip_duration=args.max_clip_len,
                 use_gpu=use_gpu,
                 show_title_card=not args.no_title,
             )
@@ -659,7 +721,7 @@ def main():
             chapters.append(f"{format_time_str(current_time)} - {title}")
             current_time += dur
             assembled_files.append(out_path)
-            print(f"    [+] 1440p Segment ready ({dur:.1f}s): {out_name}")
+            print(f"    [+] 1440p Full Segment ready ({dur:.1f}s): {out_name}")
 
         except Exception as e:
             print(f"    [!] Assembly error for {title}: {e}")
@@ -668,16 +730,18 @@ def main():
         print("\n[!] No segments were assembled. Please ensure both video clips and voiceovers exist.")
         return
 
-    # Step 3: Concat
+    # -----------------------------------------------------------------------
+    # Step 3: Concat into Master Video
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 75)
-    print(f"[*] Merging {len(assembled_files)} standardized segments into Master Video...")
+    print(f"[*] Merging {len(assembled_files)} full segments into Master Video...")
     master_output = os.path.join(args.output_dir, "master_compilation.mp4")
 
     try:
         concat_segments(assembled_files, master_output)
         print(f"[+] SUCCESS! Master Compilation Saved: {os.path.abspath(master_output)}")
         size_mb = os.path.getsize(master_output) / (1024 * 1024)
-        print(f"    Total Runtime: {format_time_str(current_time)} | File Size: {size_mb:.1f} MB")
+        print(f"    Total Video Runtime: {format_time_str(current_time)} | File Size: {size_mb:.1f} MB")
         print(f"    Format: 1440p (2560x1440 @ 60fps) | Aspect: {args.aspect.upper()}")
     except Exception as e:
         print(f"[!] Concat failed: {e}")
